@@ -11,6 +11,9 @@ export function chatCompletionsSpec(id, { maxTokensField = 'max_completion_token
   return {
     id,
     versionlessFallback,
+    // http.js may ask for a streamed answer (invoke's `stream`) and folds the SSE back into the
+    // one-shot shape below.
+    streamable: true,
     path: () => '/v1/chat/completions',
     modelsPath: '/v1/models',
     headers: key => (key ? { authorization: 'Bearer ' + key } : {}),

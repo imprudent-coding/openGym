@@ -12,6 +12,8 @@
  *   non-2xx                  → code 1, stderr "<status> <message>"   the leading 401/403 is what
  *                                                                    the pipeline's auth regex
  *                                                                    keys on
+ *   2xx carrying an error    → code 1, stderr "<status> <message>"   a gateway that answered 200
+ *                                                                    before the upstream failed
  *   cut off at max tokens    → code 1                                 a half JSON object would
  *                                                                    burn the single repair round
  *   fetch threw / aborted    → code 1 with the host / timedOut
@@ -122,8 +124,58 @@ async function call(fetchImpl, url, init, timeoutMs, signal) {
 }
 
 async function readJson(res) {
+  const type = res.headers && typeof res.headers.get === 'function' ? res.headers.get('content-type') : null;
+  if (typeof type === 'string' && /text\/event-stream/i.test(type)) return readStream(res);
   const text = await res.text();
   try { return { data: JSON.parse(text), text }; } catch { return { data: null, text }; }
+}
+
+/* A streamed Chat Completions answer (server-sent events), folded back into the one-shot shape
+ * so readText and the finish_reason === 'length' check see exactly what they see unstreamed.
+ * Streaming exists because a hosted gateway (OpenRouter) answers a non-streamed request with
+ * 200 at once, pads it with whitespace, and if the upstream gives up minutes later writes its
+ * error into that 200 body; something on the way ends such a request at about 180 s. A stream
+ * keeps tokens flowing instead. Comment lines (": OPENROUTER PROCESSING") and [DONE] are
+ * skipped, reasoning deltas are ignored, an error event wins, and a stream that stops without
+ * a finish_reason is a failure rather than a silently short answer. */
+async function readStream(res) {
+  let content = '';
+  let finish = null;
+  let error = null;
+  const onLine = raw => {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    if (!line.startsWith('data:')) return;  // comments, event:, id:, blank separators
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    let ev;
+    try { ev = JSON.parse(payload); } catch { return; }
+    if (!ev || typeof ev !== 'object') return;
+    const choice = Array.isArray(ev.choices) ? ev.choices[0] : null;
+    if (ev.error) error = ev.error;
+    else if (choice && choice.error) error = choice.error;
+    if (!choice) return;
+    const piece = choice.delta && choice.delta.content;
+    if (typeof piece === 'string') content += piece;
+    if (choice.finish_reason) finish = choice.finish_reason;
+  };
+  const body = res.body;
+  if (body && typeof body[Symbol.asyncIterator] === 'function') {
+    const decoder = typeof TextDecoder === 'function' ? new TextDecoder() : null;
+    let rest = '';
+    for await (const chunk of body) {
+      rest += typeof chunk === 'string' ? chunk : decoder ? decoder.decode(chunk, { stream: true }) : String(chunk);
+      const lines = rest.split('\n');
+      rest = lines.pop();
+      lines.forEach(onLine);
+    }
+    if (decoder) rest += decoder.decode();
+    if (rest) onLine(rest);
+  } else {
+    String(await res.text()).split('\n').forEach(onLine);
+  }
+  if (error) return { data: { error }, text: '' };
+  if (!finish) return { data: { error: { message: 'the stream ended before the model finished' } }, text: content };
+  return { data: { choices: [{ message: { content }, finish_reason: finish }] }, text: content };
 }
 
 export function httpAdapter(spec) {
@@ -198,7 +250,7 @@ export function httpAdapter(spec) {
      * native HTTP and a test can hand in a fake.
      */
     async invoke(opts = {}) {
-      const { cfg, prompt, system, schema, env, model, timeoutMs = DEFAULT_TIMEOUT_MS, maxTokens = MAX_OUTPUT_TOKENS, fetch: fetchImpl = globalThis.fetch, signal } = opts;
+      const { cfg, prompt, system, schema, env, model, timeoutMs = DEFAULT_TIMEOUT_MS, maxTokens = MAX_OUTPUT_TOKENS, fetch: fetchImpl = globalThis.fetch, signal, stream = false } = opts;
       const base = adapter.baseUrl(cfg);
       if (!base) return { code: -1, text: '', stderr: `no endpoint configured for ${id}`, spawnError: true };
       const key = keyOf(env);
@@ -208,6 +260,11 @@ export function httpAdapter(spec) {
       let chosen = substitutes.get(substituteKey(id, base, asked)) || asked;
 
       let body = spec.body({ model: chosen, prompt, system: system || null, schema: schema || null, maxTokens });
+      // Streaming is opt-in and only for a spec that says it can (Chat Completions; Anthropic's
+      // body has messages too but a different event format). The server asks for it (jobs.js,
+      // COACH_HTTP_STREAM); the phone does not, since its native fetch may not stream a body.
+      // Every retry below spreads the body, so the flag rides along.
+      if (stream && spec.streamable && Array.isArray(body.messages)) body = { ...body, stream: true };
       let triedOtherModel = false;
       let retriedWithStrictSchema = false;
       let retriedWithoutJsonMode = false;
@@ -225,6 +282,11 @@ export function httpAdapter(spec) {
           return { code: 1, text: '', stderr: `could not reach ${hostOf(base)}: ${trim(e.message, 200)}` };
         }
         const { data, text } = await readJson(res);
+        // A gateway that already sent 200 reports a later upstream failure in the body (or in a
+        // stream's error event). That is the provider's answer, not "no choices".
+        if (res.ok && data && data.error && !data.choices) {
+          return { code: 1, text: '', stderr: `${res.status} ${shownError(spec, data, 280)}` };
+        }
         if (!res.ok) {
           const msg = spec.errorMessage(data) || trim(text, 200);
           if (RETRY_STATUSES.has(res.status) && transientRetries < RETRY_DELAYS_MS.length && !(signal && signal.aborted)) {

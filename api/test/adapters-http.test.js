@@ -625,3 +625,113 @@ test('validateHeaders: small maps pass, framing names and junk do not', () => {
   const many = {}; for (let i = 0; i < 9; i++) many['x-h-' + i] = 'v';
   assert.equal(validateHeaders(many).ok, false);
 });
+
+/* Streaming (Chat Completions only, opt-in) and the 200 that carries an error. OpenRouter answers
+ * a non-streamed request with 200 at once and writes a later upstream failure into that body;
+ * "the answer had no choices" used to hide the provider's own words. */
+const SSE_TYPE = { get: name => (/content-type/i.test(name) ? 'text/event-stream' : null) };
+function sseFetch(sse, { chunks = null } = {}) {
+  const calls = [];
+  const f = async (url, init) => {
+    calls.push({ url, body: init.body ? JSON.parse(init.body) : null });
+    const res = { ok: true, status: 200, headers: SSE_TYPE, text: async () => sse };
+    if (chunks) {
+      const enc = new TextEncoder();
+      res.body = { async *[Symbol.asyncIterator]() { for (const c of chunks) yield enc.encode(c); } };
+    }
+    return res;
+  };
+  f.calls = calls;
+  return f;
+}
+const ev = obj => `data: ${JSON.stringify(obj)}\r\n\r\n`;
+const delta = (content, finish = null) => ev({ choices: [{ index: 0, delta: { content }, finish_reason: finish }] });
+const OR_ERROR = { message: 'Provider returned error', code: 502, metadata: { raw: JSON.stringify({ error: { message: 'upstream connection reset' } }), provider_name: 'Anthropic' } };
+
+test('streamed: comments and deltas fold into one answer, and the request asks for a stream', async () => {
+  const sse = ': OPENROUTER PROCESSING\r\n\r\n' + ': OPENROUTER PROCESSING\r\n\r\n'
+    + ev({ choices: [{ delta: { reasoning: 'thinking...' }, finish_reason: null }] })
+    + delta('{"coach_contract":1,') + delta('"nochange":true,"reading":"fine"}') + delta('', 'stop') + 'data: [DONE]\r\n\r\n';
+  for (const adapter of [compatible, openai]) {
+    const f = sseFetch(sse);
+    const cfg = adapter === compatible ? cfgCompat : {};
+    const r = await adapter.invoke({ cfg, prompt: 'P', env, model: 'm', fetch: f, stream: true });
+    assert.equal(r.code, 0, `${adapter.id}: ${r.stderr}`);
+    assert.equal(r.text, ANSWER);
+    assert.equal(f.calls[0].body.stream, true);
+  }
+});
+
+test('streamed: a body read in chunks that split a line still folds', async () => {
+  const whole = ': OPENROUTER PROCESSING\n\n' + delta('{"coach_contract":1,') + delta('"nochange":true,"reading":"fine"}', 'stop') + 'data: [DONE]\n\n';
+  const chunks = [];
+  for (let i = 0; i < whole.length; i += 7) chunks.push(whole.slice(i, i + 7));
+  const f = sseFetch('not used', { chunks });
+  const r = await compatible.invoke({ cfg: cfgCompat, prompt: 'P', env, model: 'm', fetch: f, stream: true });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.text, ANSWER);
+});
+
+test('streamed: finish_reason "length" is still the output-limit failure', async () => {
+  const f = sseFetch(delta('{"coach_contract":1,') + delta('"re', 'length') + 'data: [DONE]\n\n');
+  const r = await compatible.invoke({ cfg: cfgCompat, prompt: 'P', env, model: 'm', fetch: f, stream: true });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /cut off at the output limit/);
+});
+
+test('streamed: an error event reports the provider\'s own words', async () => {
+  const f = sseFetch(': OPENROUTER PROCESSING\n\n' + delta('{"coach') + ev({ error: OR_ERROR, choices: [{ delta: { content: '' }, finish_reason: 'error' }] }) + 'data: [DONE]\n\n');
+  const r = await compatible.invoke({ cfg: cfgCompat, prompt: 'P', env, model: 'm', fetch: f, stream: true });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /Provider returned error: upstream connection reset/);
+  assert.doesNotMatch(r.stderr, /no choices/);
+});
+
+test('streamed: a stream that stops without a finish_reason is a failure, not a short answer', async () => {
+  const f = sseFetch(': OPENROUTER PROCESSING\n\n' + delta('{"coach_contract":1,'));
+  const r = await compatible.invoke({ cfg: cfgCompat, prompt: 'P', env, model: 'm', fetch: f, stream: true });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /the stream ended before the model finished/);
+});
+
+test('a non-streamed 200 carrying an error reports it, and classifies as provider, not auth', async () => {
+  const body = { error: OR_ERROR, user_id: 'u1' };
+  const f = fakeFetch([{ status: 200, body: '\n\n   \n' + JSON.stringify(body) }]);
+  const r = await compatible.invoke({ cfg: cfgCompat, prompt: 'P', env, model: 'm', fetch: f });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /^200 Provider returned error: upstream connection reset/);
+  assert.doesNotMatch(r.stderr, /no choices/);
+  const g = fakeFetch([{ status: 200, body }]);
+  const cls = await attemptOnce({ adapter: compatible, cfg: cfgCompat, kind: 'review', payload: { plan: { routines: [], week: {} } }, model: 'm', invokeOpts: { env, fetch: g } }, null);
+  assert.equal(cls.errorClass, 'provider', cls.detail);
+});
+
+test('without stream: true the request carries no stream key (the phone path is unchanged)', async () => {
+  for (const adapter of [compatible, openai]) {
+    const f = fakeFetch([ok({ choices: [{ message: { content: ANSWER }, finish_reason: 'stop' }] })]);
+    const r = await adapter.invoke({ cfg: adapter === compatible ? cfgCompat : {}, prompt: 'P', env, model: 'm', fetch: f });
+    assert.equal(r.code, 0);
+    assert.ok(!('stream' in f.calls[0].body), adapter.id);
+  }
+});
+
+test('the stream flag survives the strict-schema and no-JSON-mode retries', async () => {
+  const f = fakeFetch([
+    { status: 400, body: { error: { message: "output_config.format.schema: For 'object' type, 'additionalProperties' must be explicitly set to false" } } },
+    { status: 400, body: { error: { message: 'response_format is not supported' } } },
+    { status: 400, body: { error: { message: 'response_format is not supported' } } }
+  ]);
+  await compatible.invoke({ cfg: cfgCompat, prompt: 'P', env, model: 'm', schema: REVIEW_SCHEMA, fetch: f, stream: true });
+  assert.ok(f.calls.length >= 3);
+  for (const c of f.calls) assert.equal(c.body.stream, true);
+});
+
+test('anthropic and gemini bodies never get stream', async () => {
+  const a = fakeFetch([ok({ content: [{ type: 'text', text: ANSWER }], stop_reason: 'end_turn' })]);
+  assert.equal((await anthropic.invoke({ cfg: {}, prompt: 'P', env, fetch: a, stream: true })).code, 0);
+  assert.ok(!('stream' in a.calls[0].body));
+  const g = fakeFetch([ok({ candidates: [{ content: { parts: [{ text: ANSWER }] }, finishReason: 'STOP' }] })]);
+  const gr = await gemini.invoke({ cfg: {}, prompt: 'P', env, model: 'gemini-x', fetch: g, stream: true });
+  assert.equal(gr.code, 0, gr.stderr);
+  assert.ok(!('stream' in g.calls[0].body));
+});

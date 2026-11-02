@@ -354,6 +354,14 @@ HTTP client waits as long as the job, and the chat says "this can take a while" 
 promising minutes when the endpoint is a local one. The phone's BYOK mode does the same on
 its own: a local endpoint gets 25 minutes there.
 
+The api asks the OpenAI and OpenAI-compatible providers for a streamed answer. A gateway like
+OpenRouter answers a plain request with 200 straight away, keeps the connection alive with
+padding, and something on the way ends a long generation at about 180 seconds, so a slow model
+with a big output limit failed every time whatever `COACH_JOB_TIMEOUT_MS` said. A stream keeps
+tokens flowing instead, and an error the gateway reports inside a 200 (streamed or not) now
+reaches the job log in the provider's own words. `COACH_HTTP_STREAM=0` in `.env` switches it off
+for an endpoint that cannot stream. The phone's BYOK mode always asks for one plain answer.
+
 The Coach may only touch **routines and the week**. Your training log, your weigh-ins and your
 settings are not reachable from any change type that exists.
 

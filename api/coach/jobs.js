@@ -40,6 +40,10 @@ const COACH_DIR = path.join(DATA, 'coach');
 // Five minutes by default. A local model on a small CPU box can legitimately need more; a
 // cloud API that needs more has a problem. COACH_JOB_TIMEOUT_MS overrides, never below one minute.
 export const TIMEOUT_MS = Math.max(60000, +process.env.COACH_JOB_TIMEOUT_MS || 5 * 60000);
+// Chat Completions providers (openai, compatible) are asked for a streamed answer. A gateway
+// like OpenRouter otherwise answers 200 at once, pads, and ends a long generation at about
+// 180 s whatever this budget says. COACH_HTTP_STREAM=0 goes back to one plain response.
+const STREAM = process.env.COACH_HTTP_STREAM !== '0';
 const MAX_CONCURRENT = 2;          // these are minutes-scale jobs on often-single-core boxes
 const PENDING_DAYS = 14;           // FR-33
 const HISTORY_MAX = 20;
@@ -377,7 +381,7 @@ async function execute(job) {
       adapter, cfg, kind: job.kind, payload, model: cfgStore.modelFor(cfg), timeoutMs: TIMEOUT_MS,
       // The HTTP adapters take the fetch and the abort signal they are given; the runtime
       // adapters ignore both.
-      invokeOpts: { jobDir, env, fetch: fetchFor(TIMEOUT_MS), signal: ctl.signal, maxTokens: cfg.maxOutputTokens }
+      invokeOpts: { jobDir, env, fetch: fetchFor(TIMEOUT_MS), signal: ctl.signal, maxTokens: cfg.maxOutputTokens, stream: STREAM }
     });
     if (!attempt.ok) {
       // Cancelled by a forget, not failed by the provider: the log must not blame the job budget.
@@ -492,7 +496,7 @@ export async function testRun() {
     const check = await adapter.check(cfg, env);
     if (!check.ok) return { ok: false, error: check.error || 'the provider runtime could not be run' };
     const r = await adapter.invoke({
-      cfg, jobDir, env, model: cfgStore.modelFor(cfg), timeoutMs: 90000, fetch: fetchFor(90000),
+      cfg, jobDir, env, model: cfgStore.modelFor(cfg), timeoutMs: 90000, fetch: fetchFor(90000), stream: STREAM,
       prompt: 'Reply with exactly this JSON object and nothing else: {"coach_contract":1,"ok":true}'
     });
     if (r.timedOut) return { ok: false, version: check.version, error: 'the provider did not answer in time' };

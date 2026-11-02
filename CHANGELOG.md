@@ -4,6 +4,15 @@ Newest first. Each release is a `## vX.Y.Z (YYYY-MM-DD)` section, and the releas
 GitHub and GitLab are that section, word for word. New work goes under `## Unreleased` until the
 tag. Write it for the people using the app: what changed for them, short, no em dashes.
 
+## Unreleased
+
+**The Coach finishes long plans on OpenRouter.** With a slow model and a big output limit every
+plan failed after about three minutes with "the answer had no choices", and raising
+`COACH_JOB_TIMEOUT_MS` did nothing. The server now asks OpenAI and OpenAI-compatible endpoints for
+a streamed answer, so the connection stays busy until the model is done. And when a provider
+reports an error inside an otherwise fine answer, you now see its own words instead of "no
+choices". `COACH_HTTP_STREAM=0` turns streaming off for an endpoint that can't stream.
+
 ## v1.4.3 (2026-10-26)
 
 The community release. Most of what's below was asked for on GitHub and Discord or sent in as a
