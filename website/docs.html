@@ -675,7 +675,7 @@ docker compose up -d</code></pre>
     <tr><td><code>MEDIA_MIN_FREE_MB</code></td><td>Uploads are refused while the disk under <code>./data</code> has less free space than this. Default <code>512</code>. Size limits per file type are in <a href="https://github.com/DuarteSantos8/openGym/blob/main/docs/SELF_HOSTING.md#photos-and-videos-of-custom-exercises" rel="noopener">SELF_HOSTING.md</a>.</td></tr>
     <tr><td><code>API_TARGET</code></td><td>Which API image to build: <code>default</code>, or <code>coach</code> to add the Claude Agent SDK and Codex CLI runtimes. API-key providers work on <code>default</code>.</td></tr>
     <tr><td><code>VAPID_SUBJECT</code></td><td>Contact URL sent with push notifications. Default: your <code>ORIGIN</code>.</td></tr>
-    <tr><td><code>COACH_DISABLED</code></td><td>Set <code>1</code> to switch the <a href="#coach">AI Coach</a> off harder than any toggle. <code>COACH_JOB_TIMEOUT_MS</code> raises the job budget for slow local models.</td></tr>
+    <tr><td><code>COACH_DISABLED</code></td><td>Set <code>1</code> to switch the <a href="#coach">AI Coach</a> off harder than any toggle. <code>COACH_JOB_TIMEOUT_MS</code> raises the job budget for slow local models. <code>COACH_HTTP_STREAM=0</code> stops asking OpenAI-compatible endpoints for a streamed answer (on by default, so a gateway like OpenRouter does not cut a long plan off at about three minutes).</td></tr>
   </table>
   <p>Two things that look like settings but aren't: <code>DATA_DIR</code> is pinned to
      <code>/data</code> by <code>docker-compose.yml</code> and mapped to <code>./data</code> —
