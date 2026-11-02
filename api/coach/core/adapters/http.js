@@ -283,13 +283,14 @@ export function httpAdapter(spec) {
         }
         const { data, text } = await readJson(res);
         // A gateway that already sent 200 reports a later upstream failure in the body (or in a
-        // stream's error event). That is the provider's answer, not "no choices".
-        if (res.ok && data && data.error && !data.choices) {
-          return { code: 1, text: '', stderr: `${res.status} ${shownError(spec, data, 280)}` };
-        }
-        if (!res.ok) {
+        // stream's error event). That is the provider's answer, not "no choices", and a refusal
+        // of the request (OpenRouter's "Schema is too complex") gets the same request fallbacks
+        // a 400 gets. It is never retried as transient: the generation already ran.
+        const errorIn200 = !!(res.ok && data && data.error && !data.choices);
+        if (!res.ok || errorIn200) {
           const msg = spec.errorMessage(data) || trim(text, 200);
-          if (RETRY_STATUSES.has(res.status) && transientRetries < RETRY_DELAYS_MS.length && !(signal && signal.aborted)) {
+          const refused = res.status === 400 || errorIn200;
+          if (!errorIn200 && RETRY_STATUSES.has(res.status) && transientRetries < RETRY_DELAYS_MS.length && !(signal && signal.aborted)) {
             await sleep(opts.retryDelayMs != null ? opts.retryDelayMs : RETRY_DELAYS_MS[transientRetries], signal);
             transientRetries++;
             continue;
@@ -299,7 +300,7 @@ export function httpAdapter(spec) {
           // local grammar-sampling servers keep getting the flat shape they can convert — and
           // only after the endpoint itself said no to it, so Ollama, LM Studio and vLLM never
           // see a request they did not already ask for.
-          if (res.status === 400 && spec.withStrictSchema && !retriedWithStrictSchema
+          if (refused && spec.withStrictSchema && !retriedWithStrictSchema
             && body.response_format && body.response_format.type === 'json_schema'
             && /additionalProperties|must be explicitly set/i.test(msg)) {
             body = spec.withStrictSchema(body);
@@ -309,7 +310,7 @@ export function httpAdapter(spec) {
           // Some OpenAI-compatible servers reject the JSON-mode flag outright, and some providers
           // reject a schema they cannot serve (Gemini: "the specified schema produces a constraint
           // that has too many states"). Once, without it: the validator still judges the answer.
-          if (res.status === 400 && spec.withoutJsonMode && !retriedWithoutJsonMode && /response_format|json_schema|json_object|json mode|structured|\bschema\b/i.test(msg)) {
+          if (refused && spec.withoutJsonMode && !retriedWithoutJsonMode && /response_format|json_schema|json_object|json mode|structured|\bschema\b/i.test(msg)) {
             body = spec.withoutJsonMode(body);
             retriedWithoutJsonMode = true;
             continue;

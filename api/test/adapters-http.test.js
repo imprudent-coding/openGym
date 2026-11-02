@@ -735,3 +735,29 @@ test('anthropic and gemini bodies never get stream', async () => {
   assert.equal(gr.code, 0, gr.stderr);
   assert.ok(!('stream' in g.calls[0].body));
 });
+
+test('a schema refusal inside a 200 (OpenRouter "Schema is too complex") falls back to plain JSON mode', async () => {
+  const refusal = ev({ error: { message: 'Schema is too complex.', code: 400 }, choices: [{ delta: { content: '' }, finish_reason: 'error' }] });
+  const good = delta(ANSWER, 'stop') + 'data: [DONE]\n\n';
+  const calls = [];
+  const f = async (url, init) => {
+    calls.push(JSON.parse(init.body));
+    return { ok: true, status: 200, headers: SSE_TYPE, text: async () => (calls.length === 1 ? refusal : good) };
+  };
+  const r = await compatible.invoke({ cfg: cfgCompat, prompt: 'P', env, model: 'm', schema: REVIEW_SCHEMA, fetch: f, stream: true });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.text, ANSWER);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].response_format.type, 'json_schema');
+  assert.deepEqual(calls[1].response_format, { type: 'json_object' });
+  assert.equal(calls[1].stream, true);
+
+  // Non-streamed the same, and a 200 error is never retried as transient.
+  const g = fakeFetch([{ status: 200, body: { error: { message: 'Schema is too complex.' } } }, ok({ choices: [{ message: { content: ANSWER }, finish_reason: 'stop' }] })]);
+  assert.equal((await compatible.invoke({ cfg: cfgCompat, prompt: 'P', env, model: 'm', schema: REVIEW_SCHEMA, fetch: g })).code, 0);
+  assert.deepEqual(g.calls[1].body.response_format, { type: 'json_object' });
+  const h = fakeFetch([{ status: 200, body: { error: { message: 'Provider returned error', code: 502 } } }]);
+  const hr = await compatible.invoke({ cfg: cfgCompat, prompt: 'P', env, model: 'm', fetch: h, retryDelayMs: 0 });
+  assert.equal(hr.code, 1);
+  assert.equal(h.calls.length, 1);
+});
